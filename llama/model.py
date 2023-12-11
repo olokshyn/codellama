@@ -1,9 +1,11 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 # This software may be used and distributed according to the terms of the Llama 2 Community License Agreement.
 
+import gc
+import re
 import math
 from dataclasses import dataclass
-from typing import Any, Optional, Tuple
+from typing import Any, Mapping, Optional, Tuple
 
 import fairscale.nn.model_parallel.initialize as fs_init
 import torch
@@ -22,10 +24,39 @@ elif torch.backends.mps.is_available():
 else:
     device = "cpu"
 
+
+def free_gpu_memory():
+    gc.collect()
+    torch.cuda.empty_cache()
+
+
+def gpu_tensors_map(callable):
+    for obj in gc.get_objects():
+        try:
+            if torch.is_tensor(obj) or (
+                hasattr(obj, "data") and torch.is_tensor(obj.data)
+            ):
+                if obj.device.type == "cuda":
+                    callable(obj)
+        except:
+            pass
+
+
+def collect_gpu_tensors():
+    tensors = []
+    gpu_tensors_map(lambda x: tensors.append(x))
+    return tensors
+
+
+def print_gpu_tensors():
+    return gpu_tensors_map(lambda x: print(type(x), x.size()))
+
+
 @dataclass
 class ModelArgs:
     dim: int = 4096
     n_layers: int = 32
+    n_layer_groups: int = 3  # Use >1 when the model doesn't fit into VRAM. TransformerBlock layers are split into groups, and only one group is loaded into VRAM at a time during inference.
     n_heads: int = 32
     n_kv_heads: Optional[int] = None
     vocab_size: int = -1  # defined later by tokenizer
@@ -75,8 +106,8 @@ def apply_rotary_emb(
     freqs_cis: torch.Tensor,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     if not torch.cuda.is_available():
-        xq = xq.to('cpu')
-        xk = xk.to('cpu')
+        xq = xq.to("cpu")
+        xk = xk.to("cpu")
     xq_ = torch.view_as_complex(xq.float().reshape(*xq.shape[:-1], -1, 2))
     xk_ = torch.view_as_complex(xk.float().reshape(*xk.shape[:-1], -1, 2))
     freqs_cis = reshape_for_broadcast(freqs_cis, xq_)
@@ -136,22 +167,28 @@ class Attention(nn.Module):
             init_method=lambda x: x,
         )
 
-        self.cache_k = torch.zeros(
-            (
-                args.max_batch_size,
-                args.max_seq_len,
-                self.n_local_kv_heads,
-                self.head_dim,
-            )
-        ).to(device)
-        self.cache_v = torch.zeros(
-            (
-                args.max_batch_size,
-                args.max_seq_len,
-                self.n_local_kv_heads,
-                self.head_dim,
-            )
-        ).to(device)
+        self.cache_k = torch.nn.Parameter(
+            torch.zeros(
+                (
+                    args.max_batch_size,
+                    args.max_seq_len,
+                    self.n_local_kv_heads,
+                    self.head_dim,
+                )
+            ),
+            requires_grad=False,
+        )
+        self.cache_v = torch.nn.Parameter(
+            torch.zeros(
+                (
+                    args.max_batch_size,
+                    args.max_seq_len,
+                    self.n_local_kv_heads,
+                    self.head_dim,
+                )
+            ),
+            requires_grad=False,
+        )
 
     def forward(
         self,
@@ -260,14 +297,34 @@ class Transformer(nn.Module):
         self.params = params
         self.vocab_size = params.vocab_size
         self.n_layers = params.n_layers
+        self.layer_id_map = {}
 
         self.tok_embeddings = ParallelEmbedding(
-            params.vocab_size, params.dim, init_method=lambda x: x,
+            params.vocab_size,
+            params.dim,
+            init_method=lambda x: x,
         )
 
-        self.layers = torch.nn.ModuleList()
+        self.layer_groups = torch.nn.ModuleList()
+        layers_per_group = [
+            params.n_layers // params.n_layer_groups
+        ] * params.n_layer_groups
+        for group_id in range(params.n_layers % params.n_layer_groups):
+            layers_per_group[group_id] += 1
+
+        group_id = 0
+        self.layer_groups.append(torch.nn.ModuleList())
         for layer_id in range(params.n_layers):
-            self.layers.append(TransformerBlock(layer_id, params))
+            if layers_per_group[group_id] == 0:
+                self.layer_groups.append(torch.nn.ModuleList())
+                group_id += 1
+
+            self.layer_id_map[layer_id] = (group_id, len(self.layer_groups[group_id]))
+            self.layer_groups[group_id].append(
+                TransformerBlock(layer_id, params).to("cpu")
+            )
+            layers_per_group[group_id] -= 1
+            free_gpu_memory()
 
         self.norm = RMSNorm(params.dim, eps=params.norm_eps)
         self.output = ColumnParallelLinear(
@@ -290,12 +347,56 @@ class Transformer(nn.Module):
         mask = None
         if seqlen > 1:
             mask = torch.full(
-                (1, 1, seqlen, seqlen), float("-inf"), device=torch.device('cpu')
+                (1, 1, seqlen, seqlen), float("-inf"), device=torch.device("cpu")
             )
-            mask = mask.to(torch.float32).triu(diagonal=start_pos+1).type_as(h)
+            mask = mask.to(torch.float32).triu(diagonal=start_pos + 1).type_as(h)
+            mask = mask.to(device)
 
-        for layer in self.layers:
-            h = layer(h, start_pos, freqs_cis, (mask.to(device) if mask is not None else mask))
+        for layer_group in self.layer_groups:
+            layer_group = layer_group.to(device)
+            for layer in layer_group:
+                h = layer(
+                    h,
+                    start_pos,
+                    freqs_cis,
+                    mask,
+                )
+            layer_group.to("cpu")
+            del layer_group
+            free_gpu_memory()
+
         h = self.norm(h)
         output = self.output(h).float()
         return output
+
+    def to(self, device, *args, **kwargs):
+        if not device.startswith("cuda"):
+            super().to(device, *args, **kwargs)
+        else:
+            for param_name, param in self.named_parameters():
+                if param_name.startswith("layer_groups"):
+                    continue
+                param.data = param.data.to(device)
+                if param.grad is not None:
+                    param.grad.data = param.grad.data.to(device)
+        return self
+
+    def load_state_dict(
+        self, state_dict: Mapping[str, Any], strict: bool = True, assign: bool = False
+    ):
+        param_name_re = re.compile(r"^layers\.(?P<layer_id>\d+)\.(?P<param_name>.+)$")
+        new_state_dict = {}
+        for key in state_dict:
+            m = param_name_re.match(key)
+            if m:
+                layer_id = int(m.group("layer_id"))
+                param_name = m.group("param_name")
+                layer_index = (
+                    f"{self.layer_id_map[layer_id][0]}.{self.layer_id_map[layer_id][1]}"
+                )
+                new_state_dict[f"layer_groups.{layer_index}.{param_name}"] = state_dict[
+                    key
+                ]
+            else:
+                new_state_dict[key] = state_dict[key]
+        return super().load_state_dict(new_state_dict, strict, assign)
